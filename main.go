@@ -118,14 +118,14 @@ func handleVerify(s *discordgo.Session, i *discordgo.InteractionCreate) {
 
 	domainParts := strings.Split(email, "@")
 	if len(domainParts) != 2 || !isValidKosenEmail(domainParts[1]) {
-		respondEphemeral(s, i, "Error: Please use a valid Kosen email address ending in `kosen-ac.jp`.")
+		respondEphemeral(s, i, "エラー: `kosen-ac.jp`で終わる有効な高専のメールアドレスを入力してください.")
 		return
 	}
 
 	code, err := generateVerificationCode()
 	if err != nil {
 		log.Printf("Failed to generate code: %v", err)
-		respondEphemeral(s, i, "Error: An internal issue occurred. Please contact an admin.")
+		respondEphemeral(s, i, "エラー: 内部エラーが発生しました. 管理者に連絡してください.")
 		return
 	}
 
@@ -136,11 +136,11 @@ func handleVerify(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	err = sendVerificationEmail(email, code)
 	if err != nil {
 		log.Printf("Failed to send email: %v", err)
-		respondEphemeral(s, i, "Error: Failed to send verification email. Please try again later.")
+		respondEphemeral(s, i, "エラー: 認証メールの送信に失敗しました. 時間をおいてお試しください.")
 		return
 	}
 
-	respondEphemeral(s, i, "A 6-digit verification code has been sent to your email. Please use the `/code` command to complete verification.")
+	respondEphemeral(s, i, "6桁の認証番号を送信しました. Outlookを確認し、`/code` コマンドで認証を完了させてください.")
 }
 
 func handleCode(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -152,18 +152,18 @@ func handleCode(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	codesMutex.Unlock()
 
 	if !ok || userCode != correctCode {
-		respondEphemeral(s, i, "Error: The verification code is incorrect.")
+		respondEphemeral(s, i, "エラー: 認証コードが間違っています.")
 		return
 	}
 
 	err := s.GuildMemberRoleAdd(i.GuildID, userID, verifiedRoleID)
 	if err != nil {
 		log.Printf("Failed to add role: %v", err)
-		respondEphemeral(s, i, "Error: Failed to assign role. Please contact an admin.")
+		respondEphemeral(s, i, "エラー: ロールの付与に失敗しました. 管理者に連絡してください.")
 		return
 	}
 
-	respondEphemeral(s, i, "Verification successful! This channel will be deleted in 10 seconds.")
+	respondEphemeral(s, i, "認証に成功しました! このチャンネルは10秒後に自動的に消えます.")
 
 	codesMutex.Lock()
 	delete(verificationCodes, userID)
@@ -193,6 +193,11 @@ func handleStartVerification(s *discordgo.Session, i *discordgo.InteractionCreat
 		PermissionOverwrites: []*discordgo.PermissionOverwrite{
 			{ID: guildID, Type: discordgo.PermissionOverwriteTypeRole, Deny: discordgo.PermissionViewChannel},
 			{ID: i.Member.User.ID, Type: discordgo.PermissionOverwriteTypeMember, Allow: discordgo.PermissionViewChannel},
+			{
+       				ID:    s.State.User.ID,
+        			Type:  discordgo.PermissionOverwriteTypeMember,
+        			Allow: discordgo.PermissionViewChannel | discordgo.PermissionSendMessages,
+    			},
 		},
 	})
 	if err != nil {
@@ -201,11 +206,11 @@ func handleStartVerification(s *discordgo.Session, i *discordgo.InteractionCreat
 	}
 
 	embed := &discordgo.MessageEmbed{
-		Title:       "Welcome! Let's start verification.",
-		Description: "This is a private channel visible only to you and the bot.\nPlease follow the steps below to complete verification.",
+		Title:       "ようこそ! ",
+		Description: "このチャンネルはボットとあなた専用のプライベートチャンネルです.\n手順に従って認証を完了させてください.",
 		Fields: []*discordgo.MessageEmbedField{
-			{Name: "Step 1: Register Email", Value: "Use `/verify email:your-kosen-email@s.kosen-ac.jp`"},
-			{Name: "Step 2: Enter Code", Value: "Use `/code code:123456` with the code you receive in your email."},
+			{Name: "Step 1: Emailの登録", Value: "`/verify`コマンドを使って高専のMicrosoftアドレスを入力してください"},
+			{Name: "Step 2: 認証コードの入力", Value: "`/code` コマンドを使って送信された認証コードを入力してください."},
 		},
 		Footer: &discordgo.MessageEmbedFooter{Text: "This channel will be deleted automatically upon successful verification."},
 		Color:  0x5865F2,
@@ -230,8 +235,8 @@ func setupVerificationButton(s *discordgo.Session) {
 	}
 
 	embed := &discordgo.MessageEmbed{
-		Title:       "Kosen Student Verification System",
-		Description: "To access all server features, you must verify that you are a Kosen student.\nPress the button below to create a private channel and begin the process.",
+		Title:       "高専学生認証システム",
+		Description: "全てのチャンネルを閲覧するためには、高専生であることを認証する必要があります..\n下記のボタンからプライベートチャンネルを作成し、手順に従って認証を完了させてください.",
 		Color:       0x5865F2,
 	}
 
@@ -272,7 +277,7 @@ func generateVerificationCode() (string, error) {
 
 func sendVerificationEmail(recipient, code string) error {
 	auth := smtp.PlainAuth("", gmailAddress, gmailAppPassword, "smtp.gmail.com")
-	msg := []byte("To: " + recipient + "\r\n" + "Subject: Discord Verification Code\r\n\r\n" + "Your Discord verification code is: " + code + "\r\n")
+	msg := []byte("To: " + recipient + "\r\n" + "Subject: Discord Verification Code\r\n\r\n" + "あなたの認証コードは: " + code +" です."+ "\r\n")
 	return smtp.SendMail("smtp.gmail.com:587", auth, gmailAddress, []string{recipient}, msg)
 }
 
