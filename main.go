@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/json" // FIX 1: Corrected typo from "encording"
 	"fmt"
 	"log"
 	"net/smtp"
@@ -16,17 +17,28 @@ import (
 )
 
 // --- Global Variables & Constants ---
+
+// FIX 3.1: Create a struct to hold verification data
+type verificationData struct {
+	Code  string
+	Email string
+}
+
 var (
 	botToken          string
 	guildID           string
-	verifiedRoleID    string
+	verifiedRoleID    string // This will be the general "高専生" role
 	gmailAddress      string
 	gmailAppPassword  string
 	welcomeChannelID  string
 	privateCategoryID string
 
-	verificationCodes = make(map[string]string)
-	codesMutex        = &sync.Mutex{}
+	// FIX 3.2: Update the map to use the new struct
+	pendingVerifications = make(map[string]verificationData)
+	verificationMutex    = &sync.Mutex{}
+
+	// This will hold the data from roles.json
+	schoolRoleIDs = make(map[string]string)
 )
 
 const (
@@ -44,12 +56,33 @@ func init() {
 	privateCategoryID = os.Getenv("DISCORD_PRIVATE_CATEGORY_ID")
 
 	if botToken == "" || guildID == "" || verifiedRoleID == "" || gmailAddress == "" || gmailAppPassword == "" || welcomeChannelID == "" {
-		log.Fatal("Error: Not all required environment variables are set. (DISCORD_PRIVATE_CATEGORY_ID is optional)")
+		log.Fatal("Error: Not all required environment variables are set.")
 	}
+}
+
+// Loads the roles from the JSON file
+func loadRoleIDs() error {
+	file, err := os.ReadFile("roles.json")
+	if err != nil {
+		return fmt.Errorf("could not read roles.json: %w", err)
+	}
+
+	err = json.Unmarshal(file, &schoolRoleIDs)
+	if err != nil {
+		return fmt.Errorf("could not parse roles.json: %w", err)
+	}
+
+	log.Printf("Successfully loaded %d school role mappings.", len(schoolRoleIDs))
+	return nil
 }
 
 // --- Main Function ---
 func main() {
+	// FIX 2: Load the roles.json file at startup
+	if err := loadRoleIDs(); err != nil {
+		log.Fatalf("CRITICAL: %v", err)
+	}
+
 	dg, err := discordgo.New("Bot " + botToken)
 	if err != nil {
 		log.Fatalf("Error creating Discord session: %v", err)
@@ -57,7 +90,6 @@ func main() {
 
 	dg.AddHandler(onReady)
 	dg.AddHandler(interactionHandler)
-
 	dg.Identify.Intents = discordgo.IntentsGuilds
 
 	err = dg.Open()
@@ -75,22 +107,18 @@ func main() {
 }
 
 // --- Handlers ---
-
 func onReady(s *discordgo.Session, r *discordgo.Ready) {
 	log.Printf("Logged in as: %s#%s", s.State.User.Username, s.State.User.Discriminator)
-
 	commands := []*discordgo.ApplicationCommand{
 		{Name: "verify", Description: "Start verification with your Kosen email.", Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionString, Name: "email", Description: "Your Kosen email address", Required: true}}},
 		{Name: "code", Description: "Enter the verification code sent to your email.", Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionString, Name: "code", Description: "The 6-digit verification code", Required: true}}},
 	}
-
 	log.Println("Registering commands...")
 	_, err := s.ApplicationCommandBulkOverwrite(s.State.User.ID, guildID, commands)
 	if err != nil {
 		log.Fatalf("Could not register commands: %v", err)
 	}
 	log.Println("Commands successfully registered.")
-
 	setupVerificationButton(s)
 }
 
@@ -129,9 +157,10 @@ func handleVerify(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	codesMutex.Lock()
-	verificationCodes[userID] = code
-	codesMutex.Unlock()
+	// FIX 3.3: Store both the code and the email
+	verificationMutex.Lock()
+	pendingVerifications[userID] = verificationData{Code: code, Email: email}
+	verificationMutex.Unlock()
 
 	err = sendVerificationEmail(email, code)
 	if err != nil {
@@ -140,34 +169,53 @@ func handleVerify(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	respondEphemeral(s, i, "6桁の認証番号を送信しました. Outlookを確認し、`/code` コマンドで認証を完了させてください.")
+	respondEphemeral(s, i, "6桁の認証番号を送信しました. メールを確認し、`/code` コマンドで認証を完了させてください.")
 }
 
 func handleCode(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	userCode := i.ApplicationCommandData().Options[0].StringValue()
 	userID := i.Member.User.ID
 
-	codesMutex.Lock()
-	correctCode, ok := verificationCodes[userID]
-	codesMutex.Unlock()
+	// FIX 3.4: Retrieve the stored verification data
+	verificationMutex.Lock()
+	data, ok := pendingVerifications[userID]
+	verificationMutex.Unlock()
 
-	if !ok || userCode != correctCode {
+	if !ok || userCode != data.Code {
 		respondEphemeral(s, i, "エラー: 認証コードが間違っています.")
 		return
 	}
 
+	// First, add the general "verified" role
 	err := s.GuildMemberRoleAdd(i.GuildID, userID, verifiedRoleID)
 	if err != nil {
-		log.Printf("Failed to add role: %v", err)
-		respondEphemeral(s, i, "エラー: ロールの付与に失敗しました. 管理者に連絡してください.")
+		log.Printf("Failed to add general role: %v", err)
+		respondEphemeral(s, i, "エラー: 学生ロールの付与に失敗しました. 管理者に連絡してください.")
 		return
+	}
+
+	// Then, add the school-specific role
+	domainParts := strings.Split(data.Email, "@")
+	domain := domainParts[1]
+	schoolRoleID, roleExists := schoolRoleIDs[domain]
+
+	if roleExists {
+		// FIX 4: Use '=' instead of ':=' because err is already declared
+		err = s.GuildMemberRoleAdd(i.GuildID, userID, schoolRoleID)
+		if err != nil {
+			log.Printf("Failed to add school role: %v", err)
+			respondEphemeral(s, i, "エラー: 学校ロールの付与に失敗しました. 管理者に連絡してください.")
+			// Note: We don't return here, because they still got the main role.
+		}
+	} else {
+		log.Printf("No role mapping found for domain: %s", domain)
 	}
 
 	respondEphemeral(s, i, "認証に成功しました! このチャンネルは10秒後に自動的に消えます.")
 
-	codesMutex.Lock()
-	delete(verificationCodes, userID)
-	codesMutex.Unlock()
+	verificationMutex.Lock()
+	delete(pendingVerifications, userID)
+	verificationMutex.Unlock()
 
 	time.Sleep(10 * time.Second)
 	_, err = s.ChannelDelete(i.ChannelID)
@@ -176,6 +224,7 @@ func handleCode(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	}
 }
 
+// ... (handleStartVerification and other helper functions are the same as the last correct version) ...
 func handleStartVerification(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -194,10 +243,10 @@ func handleStartVerification(s *discordgo.Session, i *discordgo.InteractionCreat
 			{ID: guildID, Type: discordgo.PermissionOverwriteTypeRole, Deny: discordgo.PermissionViewChannel},
 			{ID: i.Member.User.ID, Type: discordgo.PermissionOverwriteTypeMember, Allow: discordgo.PermissionViewChannel},
 			{
-       				ID:    s.State.User.ID,
-        			Type:  discordgo.PermissionOverwriteTypeMember,
-        			Allow: discordgo.PermissionViewChannel | discordgo.PermissionSendMessages,
-    			},
+				ID:    s.State.User.ID,
+				Type:  discordgo.PermissionOverwriteTypeMember,
+				Allow: discordgo.PermissionViewChannel | discordgo.PermissionSendMessages,
+			},
 		},
 	})
 	if err != nil {
@@ -219,8 +268,6 @@ func handleStartVerification(s *discordgo.Session, i *discordgo.InteractionCreat
 	s.ChannelMessageSendEmbed(channel.ID, embed)
 }
 
-// --- Helper Functions ---
-
 func setupVerificationButton(s *discordgo.Session) {
 	components := []discordgo.MessageComponent{
 		discordgo.ActionsRow{Components: []discordgo.MessageComponent{
@@ -228,8 +275,7 @@ func setupVerificationButton(s *discordgo.Session) {
 				Label:    "Tap Here to Start Verification",
 				Style:    discordgo.PrimaryButton,
 				CustomID: startVerificationButtonID,
-				// FIX 1: Added '&' to provide a pointer to the struct, not the struct itself.
-			
+				Emoji:    &discordgo.ComponentEmoji{Name: "✅"},
 			},
 		}},
 	}
@@ -257,7 +303,6 @@ func setupVerificationButton(s *discordgo.Session) {
 	if botMessage == nil {
 		s.ChannelMessageSendComplex(welcomeChannelID, &discordgo.MessageSend{Embed: embed, Components: components})
 	} else {
-		// FIX 2: Removed extra '&' from 'embed' because it's already a pointer.
 		s.ChannelMessageEditComplex(&discordgo.MessageEdit{Channel: welcomeChannelID, ID: botMessage.ID, Embed: embed, Components: &components})
 	}
 	log.Println("Verification button setup/update complete.")
@@ -277,7 +322,7 @@ func generateVerificationCode() (string, error) {
 
 func sendVerificationEmail(recipient, code string) error {
 	auth := smtp.PlainAuth("", gmailAddress, gmailAppPassword, "smtp.gmail.com")
-	msg := []byte("To: " + recipient + "\r\n" + "Subject: Discord Verification Code\r\n\r\n" + "あなたの認証コードは: " + code +" です."+ "\r\n")
+	msg := []byte("To: " + recipient + "\r\n" + "Subject: Discord Verification Code\r\n\r\n" + "あなたの認証コードは: " + code + " です." + "\r\n")
 	return smtp.SendMail("smtp.gmail.com:587", auth, gmailAddress, []string{recipient}, msg)
 }
 
